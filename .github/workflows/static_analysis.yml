@@ -1,0 +1,37 @@
+name: Static analysis
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    # Informativo: cppcheck y cpplint no bloquean el commit localmente
+    # (ver PRECOMMIT.md), así que tampoco bloquean acá.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck and cpplint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck python3-pip
+          pip3 install cpplint
+
+      - name: Run cppcheck
+        continue-on-error: true
+        run: |
+          cppcheck --enable=warning,style,performance --force \
+            --suppress=missingIncludeSystem \
+            --template='{file}:{line}: [{severity}] {message} ({id})' \
+            --language=c .
+
+      - name: Run cpplint
+        continue-on-error: true
+        run: |
+          find . -path ./.git -prune -o \( -name '*.c' -o -name '*.h' \) -print \
+            | xargs cpplint --filter=-legal/copyright,-build/include_subdir

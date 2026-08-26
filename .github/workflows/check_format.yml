@@ -1,0 +1,28 @@
+name: Format check
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    # Informativo: no bloquea el merge, pero deja el resultado visible en el PR
+    # para quien lo revise. El mismo chequeo corre localmente con pre-commit.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Run clang-format (usa el .clang-format de la raíz del repo)
+        run: |
+          find . -path ./.git -prune -o \( -name '*.c' -o -name '*.h' \) -print \
+            | xargs clang-format -i
+
+      - name: Fail if formatting changed files
+        run: git diff --exit-code

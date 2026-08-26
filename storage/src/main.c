@@ -1,6 +1,6 @@
 #include <utils/hello.h>
 
 int main(int argc, char* argv[]) {
-    saludar("storage");
-    return 0;
+  saludar("storage");
+  return 0;
 }
