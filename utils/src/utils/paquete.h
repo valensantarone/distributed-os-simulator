@@ -1,11 +1,20 @@
 #ifndef UTILS_SRC_UTILS_PAQUETE_H_
 #define UTILS_SRC_UTILS_PAQUETE_H_
 #include <stdint.h>
+#include <commons/collections/list.h>
 
 typedef enum {
   HANDSHAKE = 0,
-  MENSAJE = 1
-  // próximos checks: INIT_JOB, EXIT, LOAD_BATCH, etc.
+  MENSAJE = 1,
+  CREAR_JOB = 2,              // Planificador -> Placa: JID + nombre de archivo
+  ACK = 3,                    // respuesta genérica sin contenido (confirma que se procesó el pedido)
+  FETCH_INSTRUCCION = 4,      // Core -> Placa: JID + PC
+  INSTRUCCION = 5,            // Placa -> Core: string con la instrucción
+  ASIGNAR_JOB = 6,            // Planificador -> Core: JID + contexto
+  CONSULTAR_INTERRUPCION = 7, // Core -> Planificador: JID
+  RESPUESTA_INTERRUPCION = 8, // Planificador -> Core: 1 byte (0=SEGUIR, 1=DESALOJAR)
+  DEVOLVER_JOB = 9,           // Core -> Planificador: JID + contexto + motivo
+  SOLICITUD_INIT_JOB = 10     // Core -> Planificador: JID del que pide + nombre del archivo nuevo
 } op_code;
 
 typedef struct {
@@ -17,6 +26,15 @@ typedef struct {
   uint8_t codigo_operacion;
   t_buffer* buffer;
 } t_paquete;
+
+typedef struct {
+    uint32_t pc;
+    uint32_t p0, p1, p2, p3, p4, p5;
+    uint32_t ax, bx, cx, dx;
+    uint32_t e1, e2, e3;
+} t_contexto;
+
+
 
 // Genéricas (para paquetes con varios valores, checks futuros)
 t_paquete* crear_paquete(op_code codigo);
@@ -38,7 +56,28 @@ char* recibir_handshake(
 // Paquete de prueba, aparte del Handshake (la consigna los pide como dos pasos
 // separados, ver [[09-Protocolo-Comunicacion]])
 void enviar_mensaje(int fd_conexion, char* mensaje);
+
 char* recibir_mensaje(
     int fd_conexion);  // mismo mecanismo que el Handshake, opcode distinto
+
+
+    t_list* deserializar_paquete(void* buffer, int size);
+
+
+
+void enviar_jid(int fd_conexion, op_code codigo, uint32_t jid);        // CONSULTAR_INTERRUPCION
+uint32_t recibir_jid(int fd_conexion);
+
+void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar); // 0 o 1
+uint8_t recibir_respuesta_interrupcion(int fd_conexion);
+
+void enviar_fetch(int fd_conexion, uint32_t jid, uint32_t pc);          // FETCH_INSTRUCCION: dos uint32_t juntos
+void recibir_fetch(int fd_conexion, uint32_t* jid, uint32_t* pc);
+
+void enviar_instruccion(int fd_conexion, char* instruccion);           // INSTRUCCION: mismo mecanismo que enviar_mensaje
+char* recibir_instruccion(int fd_conexion);
+
+void enviar_ack(int fd_conexion);                                      // ACK: paquete sin buffer
+
 
 #endif  // UTILS_SRC_UTILS_PAQUETE_H_

@@ -38,6 +38,22 @@ static void* serializar_paquete(t_paquete* paquete, int* bytes_totales) {
   return magic;
 }
 
+t_list* deserializar_paquete(void* buffer, int size) {
+    t_list* campos = list_create();
+    int desplazamiento = 0;
+    while (desplazamiento < size) {
+        uint32_t tam_campo;
+        memcpy(&tam_campo, buffer + desplazamiento, sizeof(uint32_t));
+        desplazamiento += sizeof(uint32_t);
+        void* campo = malloc(tam_campo);
+        memcpy(campo, buffer + desplazamiento, tam_campo);
+        desplazamiento += tam_campo;
+        list_add(campos, campo);
+    }
+    return campos;
+}
+
+
 void enviar_paquete(t_paquete* paquete, int fd_conexion) {
   int bytes;
   void* a_enviar = serializar_paquete(paquete, &bytes);
