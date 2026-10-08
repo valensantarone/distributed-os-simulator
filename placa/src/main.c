@@ -99,6 +99,7 @@ void atender_conexion(int fd_conexion) {
     switch (operacion) {
       case HANDSHAKE: {
         char* nombre_modulo = recibir_handshake(fd_conexion);
+        // P1: Log de conexión con formato obligatorio del Check 1
         log_info(logger, "## Módulo: %s", nombre_modulo);
         free(nombre_modulo);
         break;
@@ -140,7 +141,7 @@ void atender_conexion(int fd_conexion) {
         list_destroy_and_destroy_elements(campos, free);
         free(buffer);
 
-        // Log obligatorio de Creación de Job y confirmación con ACK
+        // P2: Log obligatorio de Creación de Job y respuesta ACK
         log_info(logger, "## JID: %u - Job Creado", jid);
         responder_ack(fd_conexion);
         break;
@@ -153,7 +154,6 @@ void atender_conexion(int fd_conexion) {
         uint32_t jid;
         uint32_t pc;
 
-        // Soporta tanto paquete empaquetado por campos como 2 uint32_t contiguos
         if (size == sizeof(uint32_t) * 2) {
           memcpy(&jid, buffer, sizeof(uint32_t));
           memcpy(&pc, buffer + sizeof(uint32_t), sizeof(uint32_t));
@@ -180,6 +180,7 @@ void atender_conexion(int fd_conexion) {
         free(jid_str);
 
         if (instruccion_a_enviar != NULL) {
+          // P2: Log obligatorio de Obtener instrucción
           log_info(logger,
                    "## JID: %u - Obtener instrucción: %u - Instrucción: %s",
                    jid, pc, instruccion_a_enviar);
@@ -187,15 +188,15 @@ void atender_conexion(int fd_conexion) {
           free(instruccion_a_enviar);
         } else {
           log_warning(logger,
-                       "## No se encontró instrucción para JID: %u con PC: %u",
-                       jid, pc);
+                      "## No se encontró instrucción para JID: %u con PC: %u",
+                      jid, pc);
           responder_instruccion(fd_conexion, "");
         }
         break;
       }
 
       default: {
-        // Siempre se consume el buffer, si no el socket queda desfasado
+        // P5: Consumir siempre el payload para evitar desfasar el socket
         int size;
         free(recibir_buffer(&size, fd_conexion));
         log_warning(logger, "Operación no reconocida recibida: %d", operacion);
