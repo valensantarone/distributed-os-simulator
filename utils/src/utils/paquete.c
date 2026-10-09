@@ -75,11 +75,15 @@ int recibir_operacion(int fd_conexion) {
 }
 
 void* recibir_buffer(int* size, int fd_conexion) {
-  uint32_t tam;
-  recv(fd_conexion, &tam, sizeof(uint32_t), MSG_WAITALL);
-  *size = tam;
+    uint32_t tam;
+  *size = 0;
+  if (recv(fd_conexion, &tam, sizeof(uint32_t), MSG_WAITALL) <= 0) return NULL;
   void* buffer = malloc(tam);
-  recv(fd_conexion, buffer, tam, MSG_WAITALL);
+  if (tam > 0 && recv(fd_conexion, buffer, tam, MSG_WAITALL) <= 0) {
+    free(buffer);
+    return NULL;
+  }
+  *size = tam;
   return buffer;
 }
 
@@ -112,3 +116,110 @@ char* recibir_mensaje(int fd_conexion) {
       &size,
       fd_conexion);  // mismo formato que el Handshake, solo cambia el opcode
 }
+
+
+void enviar_jid(int fd_conexion, op_code codigo, uint32_t jid) {
+    t_paquete* paquete = crear_paquete(codigo);
+    paquete->buffer->size = sizeof(uint32_t);
+    paquete->buffer->stream = malloc(paquete->buffer->size);
+    memcpy(paquete->buffer->stream, &jid, sizeof(uint32_t));
+    enviar_paquete(paquete, fd_conexion);
+    eliminar_paquete(paquete);
+}     
+
+
+uint32_t recibir_jid(int fd_conexion){
+  int size;
+  void* buffer = recibir_buffer(&size, fd_conexion);
+  uint32_t jid;
+  memcpy(&jid, buffer, sizeof(uint32_t));
+  free(buffer);
+    return jid;
+}
+
+void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar){
+   t_paquete* paquete = crear_paquete(RESPUESTA_INTERRUPCION);
+    
+    
+    paquete->buffer->size = sizeof(uint8_t);
+    paquete->buffer->stream = malloc(paquete->buffer->size);
+    
+    
+    memcpy(paquete->buffer->stream, &desalojar, sizeof(uint8_t));
+    
+    enviar_paquete(paquete, fd_conexion);
+    eliminar_paquete(paquete);
+
+}
+
+uint8_t recibir_respuesta_interrupcion(int fd_conexion){
+    int size;
+    void* buffer = recibir_buffer(&size, fd_conexion);
+    
+    uint8_t desalojar;
+    memcpy(&desalojar, buffer, sizeof(uint8_t)); 
+    
+    free(buffer);
+    return desalojar;
+}
+
+void enviar_fetch(int fd_conexion, uint32_t jid, uint32_t pc){
+  t_paquete* paquete = crear_paquete(FETCH_INSTRUCCION);
+  paquete->buffer->size = sizeof(uint32_t) * 2;
+  paquete->buffer->stream = malloc(paquete->buffer->size);
+
+  memcpy(paquete->buffer->stream, &jid, sizeof(uint32_t));
+  
+  memcpy(paquete->buffer->stream + sizeof(uint32_t), &pc, sizeof(uint32_t));
+
+  enviar_paquete(paquete, fd_conexion);
+  eliminar_paquete(paquete);
+
+}       
+
+
+void recibir_fetch(int fd_conexion, uint32_t* jid, uint32_t* pc){
+  int size;
+  void* buffer = recibir_buffer(&size, fd_conexion);
+
+  memcpy(jid, buffer, sizeof(uint32_t));
+
+  memcpy(pc, buffer + sizeof(uint32_t), sizeof(uint32_t));
+    
+  free(buffer);
+}
+
+
+void enviar_instruccion(int fd_conexion, char* instruccion){
+ enviar_string(fd_conexion, INSTRUCCION, instruccion);
+}          // mismo mecanismo que enviar_mensaje
+
+
+char* recibir_instruccion(int fd_conexion){
+  int size;
+  return recibir_buffer(&size, fd_conexion);
+}
+
+void enviar_ack(int fd_conexion) {
+  t_paquete* paquete = crear_paquete(ACK);
+  enviar_paquete(paquete, fd_conexion);
+  eliminar_paquete(paquete);
+}
+
+bool recibir_ack(int fd_conexion) {
+  if (recibir_operacion(fd_conexion) != ACK) return false;
+  int size;
+  free(recibir_buffer(&size, fd_conexion));
+  return true;
+}
+
+void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar) {
+  t_paquete* paquete = crear_paquete(RESPUESTA_INTERRUPCION);
+  paquete->buffer->size = sizeof(uint8_t);
+  paquete->buffer->stream = malloc(sizeof(uint8_t));
+  memcpy(paquete->buffer->stream, &desalojar, sizeof(uint8_t));
+  enviar_paquete(paquete, fd_conexion);
+  eliminar_paquete(paquete);
+}
+
+

@@ -1,6 +1,7 @@
 #ifndef UTILS_SRC_UTILS_PAQUETE_H_
 #define UTILS_SRC_UTILS_PAQUETE_H_
 #include <stdint.h>
+#include <stdbool.h>
 #include <commons/collections/list.h>
 
 typedef enum {
@@ -64,20 +65,11 @@ char* recibir_mensaje(
     t_list* deserializar_paquete(void* buffer, int size);
 
 
-
-void enviar_jid(int fd_conexion, op_code codigo, uint32_t jid);        // CONSULTAR_INTERRUPCION
-uint32_t recibir_jid(int fd_conexion);
-
-void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar); // 0 o 1
-uint8_t recibir_respuesta_interrupcion(int fd_conexion);
-
-void enviar_fetch(int fd_conexion, uint32_t jid, uint32_t pc);          // FETCH_INSTRUCCION: dos uint32_t juntos
-void recibir_fetch(int fd_conexion, uint32_t* jid, uint32_t* pc);
-
-void enviar_instruccion(int fd_conexion, char* instruccion);           // INSTRUCCION: mismo mecanismo que enviar_mensaje
-char* recibir_instruccion(int fd_conexion);
-
-void enviar_ack(int fd_conexion);                                      // ACK: paquete sin buffer
+void enviar_ack(int fd_conexion);
+bool recibir_ack(int fd_conexion);  // false si no llegó un ACK o se cortó la conexión
+void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar);  // 0 o 1
+void enviar_instruccion(int fd_conexion, char* instruccion);
+void enviar_ack(int fd_conexion);          // ACK: paquete sin buffer
 
 
 #endif  // UTILS_SRC_UTILS_PAQUETE_H_
