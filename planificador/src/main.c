@@ -187,9 +187,9 @@ static void finalizar_job(t_job* job, char* motivo) {
   cambiar_estado(job, EXIT_ESTADO);
   log_info(logger,
            "## (%u) finalizó su ejecución con motivo de %s. Estadísticas: "
-           "Tiempo total: %" PRId64 "ms - Tiempo en NEW: %%" PRId64
+           "Tiempo total: %" PRId64 "ms - Tiempo en NEW: %" PRId64
            "ms - Tiempo en READY: "
-           "%%" PRId64
+           "%" PRId64
            "ms - Memoria máxima: 0 - Syscalls: %d - Page Faults: 0 - "
            "Transiciones READY-EXEC: %d",
            job->jid, motivo, ms_entre(job->creado, job->ultimo_cambio),

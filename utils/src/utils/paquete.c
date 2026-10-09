@@ -39,20 +39,19 @@ static void* serializar_paquete(t_paquete* paquete, int* bytes_totales) {
 }
 
 t_list* deserializar_paquete(void* buffer, int size) {
-    t_list* campos = list_create();
-    int desplazamiento = 0;
-    while (desplazamiento < size) {
-        uint32_t tam_campo;
-        memcpy(&tam_campo, buffer + desplazamiento, sizeof(uint32_t));
-        desplazamiento += sizeof(uint32_t);
-        void* campo = malloc(tam_campo);
-        memcpy(campo, buffer + desplazamiento, tam_campo);
-        desplazamiento += tam_campo;
-        list_add(campos, campo);
-    }
-    return campos;
+  t_list* campos = list_create();
+  int desplazamiento = 0;
+  while (desplazamiento < size) {
+    uint32_t tam_campo;
+    memcpy(&tam_campo, buffer + desplazamiento, sizeof(uint32_t));
+    desplazamiento += sizeof(uint32_t);
+    void* campo = malloc(tam_campo);
+    memcpy(campo, buffer + desplazamiento, tam_campo);
+    desplazamiento += tam_campo;
+    list_add(campos, campo);
+  }
+  return campos;
 }
-
 
 void enviar_paquete(t_paquete* paquete, int fd_conexion) {
   int bytes;
@@ -75,7 +74,7 @@ int recibir_operacion(int fd_conexion) {
 }
 
 void* recibir_buffer(int* size, int fd_conexion) {
-    uint32_t tam;
+  uint32_t tam;
   *size = 0;
   if (recv(fd_conexion, &tam, sizeof(uint32_t), MSG_WAITALL) <= 0) return NULL;
   void* buffer = malloc(tam);
@@ -117,89 +116,6 @@ char* recibir_mensaje(int fd_conexion) {
       fd_conexion);  // mismo formato que el Handshake, solo cambia el opcode
 }
 
-
-void enviar_jid(int fd_conexion, op_code codigo, uint32_t jid) {
-    t_paquete* paquete = crear_paquete(codigo);
-    paquete->buffer->size = sizeof(uint32_t);
-    paquete->buffer->stream = malloc(paquete->buffer->size);
-    memcpy(paquete->buffer->stream, &jid, sizeof(uint32_t));
-    enviar_paquete(paquete, fd_conexion);
-    eliminar_paquete(paquete);
-}     
-
-
-uint32_t recibir_jid(int fd_conexion){
-  int size;
-  void* buffer = recibir_buffer(&size, fd_conexion);
-  uint32_t jid;
-  memcpy(&jid, buffer, sizeof(uint32_t));
-  free(buffer);
-    return jid;
-}
-
-void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar){
-   t_paquete* paquete = crear_paquete(RESPUESTA_INTERRUPCION);
-    
-    
-    paquete->buffer->size = sizeof(uint8_t);
-    paquete->buffer->stream = malloc(paquete->buffer->size);
-    
-    
-    memcpy(paquete->buffer->stream, &desalojar, sizeof(uint8_t));
-    
-    enviar_paquete(paquete, fd_conexion);
-    eliminar_paquete(paquete);
-
-}
-
-uint8_t recibir_respuesta_interrupcion(int fd_conexion){
-    int size;
-    void* buffer = recibir_buffer(&size, fd_conexion);
-    
-    uint8_t desalojar;
-    memcpy(&desalojar, buffer, sizeof(uint8_t)); 
-    
-    free(buffer);
-    return desalojar;
-}
-
-void enviar_fetch(int fd_conexion, uint32_t jid, uint32_t pc){
-  t_paquete* paquete = crear_paquete(FETCH_INSTRUCCION);
-  paquete->buffer->size = sizeof(uint32_t) * 2;
-  paquete->buffer->stream = malloc(paquete->buffer->size);
-
-  memcpy(paquete->buffer->stream, &jid, sizeof(uint32_t));
-  
-  memcpy(paquete->buffer->stream + sizeof(uint32_t), &pc, sizeof(uint32_t));
-
-  enviar_paquete(paquete, fd_conexion);
-  eliminar_paquete(paquete);
-
-}       
-
-
-void recibir_fetch(int fd_conexion, uint32_t* jid, uint32_t* pc){
-  int size;
-  void* buffer = recibir_buffer(&size, fd_conexion);
-
-  memcpy(jid, buffer, sizeof(uint32_t));
-
-  memcpy(pc, buffer + sizeof(uint32_t), sizeof(uint32_t));
-    
-  free(buffer);
-}
-
-
-void enviar_instruccion(int fd_conexion, char* instruccion){
- enviar_string(fd_conexion, INSTRUCCION, instruccion);
-}          // mismo mecanismo que enviar_mensaje
-
-
-char* recibir_instruccion(int fd_conexion){
-  int size;
-  return recibir_buffer(&size, fd_conexion);
-}
-
 void enviar_ack(int fd_conexion) {
   t_paquete* paquete = crear_paquete(ACK);
   enviar_paquete(paquete, fd_conexion);
@@ -222,4 +138,6 @@ void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar) {
   eliminar_paquete(paquete);
 }
 
-
+void enviar_instruccion(int fd_conexion, char* instruccion) {
+  enviar_string(fd_conexion, INSTRUCCION, instruccion);
+}
