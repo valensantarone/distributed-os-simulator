@@ -1,0 +1,3 @@
+INIT_JOB largo.txt
+INIT_JOB largo.txt
+EXIT
