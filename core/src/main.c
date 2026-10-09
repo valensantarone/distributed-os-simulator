@@ -1,7 +1,10 @@
 #include <commons/config.h>
 #include <commons/log.h>
+#include <commons/string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <utils/conexion.h>
 #include <utils/paquete.h>
 
@@ -10,9 +13,26 @@
 
 t_log* logger;
 
+static void loguear_ejecucion(uint32_t jid, char* instruccion) {
+  char* espacio = strchr(instruccion, ' ');
+  if (espacio == NULL) {
+    log_info(logger, "## JID: %u - Ejecutando: %s", jid, instruccion);
+  } else {
+    log_info(logger, "## JID: %u - Ejecutando: %.*s - %s", jid,
+             (int)(espacio - instruccion), instruccion, espacio + 1);
+  }
+}
+
 int main(int argc, char* argv[]) {
+  if (argc < 3) {
+    fprintf(stderr, "Uso: %s [Archivo Config] [Identificador]\n", argv[0]);
+    return EXIT_FAILURE;
+  }
   t_config* config = config_create(argv[1]);
-  logger = log_create("core.log", "Core", 1, LOG_LEVEL_INFO);
+  char* nombre_log = string_from_format("core_%s.log", argv[2]);
+  logger = log_create(nombre_log, "Core", 1,
+                      log_level_from_string(config_get_string_value(config, "LOG_LEVEL")));
+  free(nombre_log);
 
   int fd_planificador =
       crear_conexion(config_get_string_value(config, "IP_PLANIFICADOR"),
@@ -29,32 +49,41 @@ int main(int argc, char* argv[]) {
   enviar_mensaje(fd_placa, "Mensaje de prueba desde CORE");
 
   //Bucle principal del ciclo de instrucción
-  while (1) {
-    uint32_t jid;
-    t_contexto contexto;
+  uint32_t jid;
+  t_contexto contexto;
+  bool conectado = true;
 
-    recibir_asignacion_job(fd_planificador, &jid, &contexto);
-
+  while (conectado && recibir_asignacion_job(fd_planificador, &jid, &contexto)) {
     bool ejecutando_job = true;
 
     while (ejecutando_job) {
       //Fetch
-      log_info(logger, "## JID: %d - FETCH - Program Counter: %d", jid, contexto.pc);
+      log_info(logger, "## JID: %u - FETCH - Program Counter: %u", jid, contexto.pc);
       enviar_fetch(fd_placa, jid, contexto.pc);
       char* instruccion = recibir_instruccion(fd_placa);
+      if (instruccion == NULL) {
+        log_error(logger, "Se perdió la conexión con la Placa");
+        conectado = false;
+        break;
+      }
 
       //Decode & Execute
-      log_info(logger, "## JID: %d - Ejecutando: %s", jid, instruccion);
-
       bool pc_modificado = false;
       t_tipo_instruccion tipo = decodificar_y_ejecutar(instruccion, &contexto, &pc_modificado);
+
+      if (tipo == INST_INVALIDA) {
+        log_warning(logger, "JID: %u - Instrucción inválida o fin de archivo sin EXIT (PC %u): '%s'",
+                    jid, contexto.pc, instruccion);
+      } else {
+        loguear_ejecucion(jid, instruccion);
+      }
 
       if (tipo == INST_INIT_JOB) {
         char* archivo = obtener_parametro_archivo(instruccion);
         enviar_solicitud_init_job(fd_planificador, jid, archivo);
         free(archivo);
         recibir_ack(fd_planificador);
-      } else if (tipo == INST_EXIT) {
+      } else if (tipo == INST_EXIT || tipo == INST_INVALIDA) {
         enviar_devolver_job(fd_planificador, jid, &contexto, 1);
         ejecutando_job = false;
       }
@@ -65,13 +94,18 @@ int main(int argc, char* argv[]) {
 
       //Actualización del Program Counter
       if (!pc_modificado) {
-      contexto.pc++;
+        contexto.pc++;
       }
 
       //Check Interrupt
       enviar_consultar_interrupcion(fd_planificador, jid);
-      uint8_t desalojar = recibir_respuesta_interrupcion(fd_planificador);
+      int desalojar = recibir_respuesta_interrupcion(fd_planificador);
 
+      if (desalojar < 0) {
+        log_error(logger, "Se perdió la conexión con el Planificador");
+        conectado = false;
+        break;
+      }
       if (desalojar == 1) {
         log_info(logger, "## Interrupción recibida");
         enviar_devolver_job(fd_planificador, jid, &contexto, 0);
@@ -79,6 +113,8 @@ int main(int argc, char* argv[]) {
       }
     }
   }
+
+  log_info(logger, "Finalizando Core");
 
   cerrar_conexion(fd_planificador);
   cerrar_conexion(fd_placa);

@@ -9,7 +9,8 @@
 typedef enum {
     INST_LENGUAJE_COMUN,
     INST_INIT_JOB,
-    INST_EXIT
+    INST_EXIT,
+    INST_INVALIDA
 } t_tipo_instruccion;
 
 //Decodificación y ejecución local

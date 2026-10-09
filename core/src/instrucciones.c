@@ -23,42 +23,51 @@ uint32_t* obtener_registro(t_contexto* contexto, char* nombre_registro) {
     return NULL;
 }
 
+//Devuelve el valor de un operando: si es un registro, su contenido; si no, el número
+static uint32_t obtener_valor(t_contexto* contexto, char* token) {
+    uint32_t* registro = obtener_registro(contexto, token);
+    if (registro) return *registro;
+    return (uint32_t) atoi(token);
+}
+
 //Parseo y ejecución de instrucciones
 t_tipo_instruccion decodificar_y_ejecutar(char* instruccion_str, t_contexto* contexto, bool* pc_modificado) {
     *pc_modificado = false;
 
     char** tokens = string_split(instruccion_str, " ");
-    char* operacion = tokens[0];
+    int cantidad = string_array_size(tokens);
+    char* operacion = cantidad > 0 ? tokens[0] : "";
     t_tipo_instruccion resultado = INST_LENGUAJE_COMUN;
 
     if (strcmp(operacion, "NOOP") == 0) {
     }
-    else if (strcmp(operacion, "SET") == 0) {
+    else if (strcmp(operacion, "SET") == 0 && cantidad == 3) {
         uint32_t* registro = obtener_registro(contexto, tokens[1]);
-        if (registro) *registro = (uint32_t) atoi(tokens[2]);
+        if (registro) *registro = obtener_valor(contexto, tokens[2]);
     }
-    else if (strcmp(operacion, "SUM") == 0) {
-        uint32_t* registro_destino = obtener_registro(contexto, tokens[1]);
-        uint32_t* registro_origen = obtener_registro(contexto, tokens[2]);
-        if (registro_destino && registro_origen) *registro_destino += *registro_origen;
+    else if (strcmp(operacion, "SUM") == 0 && cantidad == 3) {
+        uint32_t* registro = obtener_registro(contexto, tokens[1]);
+        if (registro) *registro += obtener_valor(contexto, tokens[2]);
     }
-    else if (strcmp(operacion, "SUB") == 0) {
-        uint32_t* registro_destino = obtener_registro(contexto, tokens[1]);
-        uint32_t* registro_origen = obtener_registro(contexto, tokens[2]);
-        if (registro_destino && registro_origen) *registro_destino -= *registro_origen;
+    else if (strcmp(operacion, "SUB") == 0 && cantidad == 3) {
+        uint32_t* registro = obtener_registro(contexto, tokens[1]);
+        if (registro) *registro -= obtener_valor(contexto, tokens[2]);
     }
-    else if (strcmp(operacion, "JNZ") == 0) {
+    else if (strcmp(operacion, "JNZ") == 0 && cantidad == 3) {
         uint32_t* registro = obtener_registro(contexto, tokens[1]);
         if (registro && *registro != 0) {
             contexto->pc = (uint32_t) atoi(tokens[2]);
             *pc_modificado = true;
         }
     }
-    else if (strcmp(operacion, "INIT_JOB") == 0) {
+    else if (strcmp(operacion, "INIT_JOB") == 0 && cantidad == 2) {
         resultado = INST_INIT_JOB;
     }
     else if (strcmp(operacion, "EXIT") == 0) {
         resultado = INST_EXIT;
+    }
+    else {
+        resultado = INST_INVALIDA;
     }
 
     string_array_destroy(tokens);
