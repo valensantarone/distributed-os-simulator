@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <utils/conexion.h>
 #include <utils/paquete.h>
 #include <utils/servidor.h>
@@ -15,9 +16,17 @@
 t_log* logger;
 t_config* config;
 char* path_instrucciones;
+int retardo_memoria = 0;  // ms que se espera antes de dar cada respuesta
 
 t_dictionary* instrucciones_por_job;
 pthread_mutex_t mutex_instrucciones = PTHREAD_MUTEX_INITIALIZER;
+
+// Espera RETARDO_MEMORIA milisegundos (se llama antes de cada respuesta)
+static void esperar_retardo_memoria(void) {
+  struct timespec espera = {retardo_memoria / 1000,
+                            (retardo_memoria % 1000) * 1000000L};
+  nanosleep(&espera, NULL);
+}
 
 // Destructor para las listas de instrucciones en el diccionario
 void destruir_lista_instrucciones(void* elemento) {
@@ -49,7 +58,10 @@ static void responder_instruccion(int fd_conexion, const char* instruccion) {
  */
 static t_list* cargar_instrucciones_desde_archivo(const char* nombre_archivo) {
   char* path_completo;
-  if (string_ends_with(path_instrucciones, "/")) {
+  if (string_starts_with((char*)nombre_archivo, "/")) {
+    // Ruta absoluta: se usa tal cual, sin anteponer PATH_INSTRUCCIONES
+    path_completo = string_duplicate((char*)nombre_archivo);
+  } else if (string_ends_with(path_instrucciones, "/")) {
     path_completo =
         string_from_format("%s%s", path_instrucciones, nombre_archivo);
   } else {
@@ -143,6 +155,7 @@ void atender_conexion(int fd_conexion) {
 
         // P2: Log obligatorio de Creación de Job y respuesta ACK
         log_info(logger, "## JID: %u - Job Creado", jid);
+        esperar_retardo_memoria();
         responder_ack(fd_conexion);
         break;
       }
@@ -178,6 +191,8 @@ void atender_conexion(int fd_conexion) {
         pthread_mutex_unlock(&mutex_instrucciones);
 
         free(jid_str);
+
+        esperar_retardo_memoria();
 
         if (instruccion_a_enviar != NULL) {
           // P2: Log obligatorio de Obtener instrucción
@@ -232,6 +247,10 @@ int main(int argc, char* argv[]) {
         "PATH_INSTRUCCIONES no configurado en %s, usando './' por defecto",
         config_path);
     path_instrucciones = "./";
+  }
+
+  if (config_has_property(config, "RETARDO_MEMORIA")) {
+    retardo_memoria = config_get_int_value(config, "RETARDO_MEMORIA");
   }
 
   instrucciones_por_job = dictionary_create();

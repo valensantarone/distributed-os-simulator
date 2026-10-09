@@ -195,6 +195,13 @@ static void finalizar_job(t_job* job, char* motivo) {
            job->jid, motivo, ms_entre(job->creado, job->ultimo_cambio),
            job->ms_en_new, job->ms_en_ready, job->syscalls, job->veces_en_exec);
 
+  t_contexto* c = &job->contexto;
+  log_info(logger,
+           "## (%u) Contexto final: PC=%u AX=%u BX=%u CX=%u DX=%u P0=%u P1=%u "
+           "P2=%u P3=%u P4=%u P5=%u E1=%u E2=%u E3=%u",
+           job->jid, c->pc, c->ax, c->bx, c->cx, c->dx, c->p0, c->p1, c->p2,
+           c->p3, c->p4, c->p5, c->e1, c->e2, c->e3);
+
   char* clave = string_itoa(job->jid);
   dictionary_remove(jobs, clave);
   free(clave);
