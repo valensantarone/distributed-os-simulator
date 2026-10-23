@@ -141,3 +141,41 @@ void enviar_respuesta_interrupcion(int fd_conexion, uint8_t desalojar) {
 void enviar_instruccion(int fd_conexion, char* instruccion) {
   enviar_string(fd_conexion, INSTRUCCION, instruccion);
 }
+
+bool placa_leer(int fd_placa, uint32_t jid, uint32_t dir_fisica,
+                uint32_t tamanio, void* destino) {
+  t_paquete* paquete = crear_paquete(LEER_MEMORIA);
+  agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+  agregar_a_paquete(paquete, &dir_fisica, sizeof(uint32_t));
+  agregar_a_paquete(paquete, &tamanio, sizeof(uint32_t));
+  enviar_paquete(paquete, fd_placa);
+  eliminar_paquete(paquete);
+
+  if (recibir_operacion(fd_placa) != DATOS_MEMORIA) return false;
+  int size;
+  void* datos = recibir_buffer(&size, fd_placa);  // crudo: son los bytes
+  if (datos == NULL) return false;
+  memcpy(destino, datos, (uint32_t)size < tamanio ? (uint32_t)size : tamanio);
+  free(datos);
+  return true;
+}
+
+bool placa_escribir(int fd_placa, uint32_t jid, uint32_t dir_fisica,
+                    uint32_t tamanio, void* origen) {
+  t_paquete* paquete = crear_paquete(ESCRIBIR_MEMORIA);
+  agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+  agregar_a_paquete(paquete, &dir_fisica, sizeof(uint32_t));
+  agregar_a_paquete(paquete, &tamanio, sizeof(uint32_t));
+  agregar_a_paquete(paquete, origen, tamanio);
+  enviar_paquete(paquete, fd_placa);
+  eliminar_paquete(paquete);
+  return recibir_ack(fd_placa);
+}
+
+bool placa_deslockear(int fd_placa, uint32_t jid) {
+  t_paquete* paquete = crear_paquete(DESLOCKEAR_PAGINAS);
+  agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+  enviar_paquete(paquete, fd_placa);
+  eliminar_paquete(paquete);
+  return recibir_ack(fd_placa);
+}
