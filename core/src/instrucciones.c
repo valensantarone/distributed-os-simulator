@@ -24,7 +24,7 @@ uint32_t* obtener_registro(t_contexto* contexto, char* nombre_registro) {
 }
 
 //Devuelve el valor de un operando: si es un registro, su contenido; si no, el número
-static uint32_t obtener_valor(t_contexto* contexto, char* token) {
+uint32_t obtener_valor(t_contexto* contexto, char* token) {
     uint32_t* registro = obtener_registro(contexto, token);
     if (registro) return *registro;
     return (uint32_t) atoi(token);
@@ -65,6 +65,27 @@ t_tipo_instruccion decodificar_y_ejecutar(char* instruccion_str, t_contexto* con
     }
     else if (strcmp(operacion, "EXIT") == 0) {
         resultado = INST_EXIT;
+    }
+    else if ((strcmp(operacion, "FORWARD") == 0 || strcmp(operacion, "BACKWARD") == 0) && cantidad == 5 && obtener_registro(contexto, tokens[4]) != NULL) {
+        resultado = INST_ENTRENAMIENTO;
+    }
+    else if (strcmp(operacion, "UPDATE") == 0 && cantidad == 4) {
+        resultado = INST_ENTRENAMIENTO;
+    }
+    else if (strcmp(operacion, "ALLOC") == 0 && cantidad == 3 && obtener_registro(contexto, tokens[1]) != NULL) {
+        resultado = INST_ALLOC;
+    }
+    else if (strcmp(operacion, "FREE") == 0 && cantidad == 2) {
+        resultado = INST_FREE;
+    }
+    else if ((strcmp(operacion, "LOAD_BATCH") == 0 || strcmp(operacion, "SAVE_CHECKPOINT") == 0 || strcmp(operacion, "LOAD_CHECKPOINT") == 0) && cantidad == 4) {
+        resultado = INST_SYSCALL_BLOQUEANTE;
+    }
+    else if ((strcmp(operacion, "LABEL") == 0 || strcmp(operacion, "REPORT") == 0) && cantidad == 3) {
+        resultado = INST_SYSCALL_BLOQUEANTE;
+    }
+    else if (strcmp(operacion, "DELETE_CHECKPOINT") == 0 && cantidad == 2) {
+        resultado = INST_SYSCALL_BLOQUEANTE;
     }
     else {
         resultado = INST_INVALIDA;

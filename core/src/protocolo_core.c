@@ -75,3 +75,104 @@ void enviar_solicitud_init_job(int fd_planificador, uint32_t jid, char* archivo)
     enviar_paquete(paquete, fd_planificador);
     eliminar_paquete(paquete);
 }
+
+//Lee los campos de una respuesta armada con agregar_a_paquete (NULL si se cortó)
+static t_list* recibir_campos(int fd, op_code esperado, int cant_campos) {
+    if (recibir_operacion(fd) != esperado) return NULL;
+    int size;
+    void* buffer = recibir_buffer(&size, fd);
+    if (buffer == NULL) return NULL;
+    t_list* campos = deserializar_paquete(buffer, size);
+    free(buffer);
+    if (list_size(campos) < cant_campos) {
+        list_destroy_and_destroy_elements(campos, free);
+        return NULL;
+    }
+    return campos;
+}
+
+uint32_t pedir_tam_pagina(int fd_placa) {
+    t_paquete* paquete = crear_paquete(PEDIR_TAM_PAGINA);
+    enviar_paquete(paquete, fd_placa);
+    eliminar_paquete(paquete);
+
+    t_list* campos = recibir_campos(fd_placa, RESPUESTA_TAM_PAGINA, 1);
+    if (campos == NULL) return 0;
+    uint32_t tam_pagina = *(uint32_t*) list_get(campos, 0);
+    list_destroy_and_destroy_elements(campos, free);
+    return tam_pagina;
+}
+
+//Pide el marco de una página. Si está, la Placa la deja lockeada
+int64_t pedir_marco(int fd_placa, uint32_t jid, uint32_t nro_pagina) {
+    t_paquete* paquete = crear_paquete(OBTENER_MARCO);
+    agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+    agregar_a_paquete(paquete, &nro_pagina, sizeof(uint32_t));
+    enviar_paquete(paquete, fd_placa);
+    eliminar_paquete(paquete);
+
+    t_list* campos = recibir_campos(fd_placa, MARCO, 1);
+    if (campos == NULL) return -2;
+    int32_t marco = *(int32_t*) list_get(campos, 0);
+    list_destroy_and_destroy_elements(campos, free);
+    return marco;  // -1 = Page Fault
+}
+
+//Devuelve el Job por Page Fault: mismo DEVOLVER_JOB, con la página como cuarto campo
+void enviar_page_fault(int fd_planificador, uint32_t jid, t_contexto* contexto, uint32_t nro_pagina) {
+    uint8_t motivo = PAGE_FAULT;
+    t_paquete* paquete = crear_paquete(DEVOLVER_JOB);
+    agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+    agregar_a_paquete(paquete, contexto, sizeof(t_contexto));
+    agregar_a_paquete(paquete, &motivo, sizeof(uint8_t));
+    agregar_a_paquete(paquete, &nro_pagina, sizeof(uint32_t));
+    enviar_paquete(paquete, fd_planificador);
+    eliminar_paquete(paquete);
+}
+
+void enviar_solicitud_alloc(int fd_planificador, uint32_t jid, uint32_t tamanio) {
+    t_paquete* paquete = crear_paquete(SOLICITUD_ALLOC);
+    agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+    agregar_a_paquete(paquete, &tamanio, sizeof(uint32_t));
+    enviar_paquete(paquete, fd_planificador);
+    eliminar_paquete(paquete);
+}
+
+int recibir_respuesta_alloc(int fd_planificador, uint32_t* dir_logica) {
+    t_list* campos = recibir_campos(fd_planificador, RESPUESTA_ALLOC, 2);
+    if (campos == NULL) return -1;
+    int ok = *(uint8_t*) list_get(campos, 0);
+    *dir_logica = *(uint32_t*) list_get(campos, 1);
+    list_destroy_and_destroy_elements(campos, free);
+    return ok;
+}
+
+void enviar_solicitud_free(int fd_planificador, uint32_t jid, uint32_t dir_logica) {
+    t_paquete* paquete = crear_paquete(SOLICITUD_FREE);
+    agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+    agregar_a_paquete(paquete, &dir_logica, sizeof(uint32_t));
+    enviar_paquete(paquete, fd_planificador);
+    eliminar_paquete(paquete);
+}
+
+//Syscall bloqueante: libera el Core. Lleva el contexto (con el PC ya avanzado)
+//y el rango ya traducido: un t_par_fisico por cada página
+void enviar_syscall_bloqueante(int fd_planificador, uint32_t jid, t_contexto* contexto, uint8_t tipo, char* nombre, uint32_t tamanio, t_list* pares) {
+    uint32_t cant_pares = list_size(pares);
+    t_par_fisico* arreglo = malloc(sizeof(t_par_fisico) * (cant_pares + 1));
+    for (uint32_t i = 0; i < cant_pares; i++) {
+        arreglo[i] = *(t_par_fisico*) list_get(pares, i);
+    }
+
+    t_paquete* paquete = crear_paquete(SYSCALL_BLOQUEANTE);
+    agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
+    agregar_a_paquete(paquete, contexto, sizeof(t_contexto));
+    agregar_a_paquete(paquete, &tipo, sizeof(uint8_t));
+    agregar_a_paquete(paquete, nombre, strlen(nombre) + 1);
+    agregar_a_paquete(paquete, &tamanio, sizeof(uint32_t));
+    agregar_a_paquete(paquete, &cant_pares, sizeof(uint32_t));
+    agregar_a_paquete(paquete, arreglo, sizeof(t_par_fisico) * cant_pares);
+    enviar_paquete(paquete, fd_planificador);
+    eliminar_paquete(paquete);
+    free(arreglo);
+}
