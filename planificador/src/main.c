@@ -15,8 +15,13 @@
 #include <utils/paquete.h>
 #include <utils/servidor.h>
 
-typedef enum { NEW, READY, EXEC, EXIT_ESTADO } t_estado_job;
-enum { FIN_QUANTUM = 0, FIN_EJECUCION = 1 };  // motivo de DEVOLVER_JOB
+#include "placa_cliente.h"
+#include "planificador.h"
+#include "servicios.h"
+
+// Los motivos de DEVOLVER_JOB (FIN_QUANTUM, FIN_EJECUCION, PAGE_FAULT,
+// FIN_ERROR) ahora están en utils/paquete.h
+typedef enum { NEW, READY, EXEC, BLOCKED, EXIT_ESTADO } t_estado_job;
 
 typedef struct {
   uint32_t jid;
@@ -31,6 +36,10 @@ typedef struct {
   int64_t ms_en_ready;
   int syscalls;
   int veces_en_exec;  // transiciones READY -> EXEC
+  int page_faults;
+  uint32_t memoria_actual;  // bytes de los ALLOC vigentes
+  uint32_t memoria_maxima;
+  t_dictionary* asignaciones;  // dir. lógica (string) -> uint32_t* tamaño
 } t_job;
 
 typedef struct {
@@ -52,12 +61,9 @@ t_queue* cola_new;
 t_queue* cola_ready;
 t_list* cores;  // t_core*
 uint32_t proximo_jid = 0;
-int jobs_admitidos = 0;  // Jobs en READY o EXEC
+int jobs_admitidos = 0;  // Jobs en READY, EXEC o BLOCKED
 pthread_mutex_t mutex_jobs =
     PTHREAD_MUTEX_INITIALIZER;  // protege todo lo de arriba
-
-int fd_placa;
-pthread_mutex_t mutex_fd_placa = PTHREAD_MUTEX_INITIALIZER;
 
 static int64_t ms_entre(struct timespec desde, struct timespec hasta) {
   return (hasta.tv_sec - desde.tv_sec) * 1000 +
@@ -78,6 +84,8 @@ static char* nombre_estado(t_estado_job estado) {
       return "READY";
     case EXEC:
       return "EXEC";
+    case BLOCKED:
+      return "BLOCKED";
     default:
       return "EXIT";
   }
@@ -95,17 +103,6 @@ static void cambiar_estado(t_job* job, t_estado_job nuevo) {
            nombre_estado(job->estado), nombre_estado(nuevo));
   job->estado = nuevo;
   job->ultimo_cambio = t;
-}
-
-void crear_job_en_placa(uint32_t jid, char* archivo) {
-  pthread_mutex_lock(&mutex_fd_placa);
-  t_paquete* paquete = crear_paquete(CREAR_JOB);
-  agregar_a_paquete(paquete, &jid, sizeof(uint32_t));
-  agregar_a_paquete(paquete, archivo, strlen(archivo) + 1);
-  enviar_paquete(paquete, fd_placa);
-  eliminar_paquete(paquete);
-  recibir_ack(fd_placa);  // consume op_code + size antes de soltar el lock
-  pthread_mutex_unlock(&mutex_fd_placa);
 }
 
 // Largo plazo: NEW -> READY por FIFO mientras lo permita el grado
@@ -161,6 +158,7 @@ static void crear_job(char* archivo) {
   job->archivo_pseudocodigo = strdup(archivo);
   job->creado = ahora();
   job->ultimo_cambio = job->creado;
+  job->asignaciones = dictionary_create();
 
   pthread_mutex_lock(&mutex_jobs);
   char* clave = string_itoa(jid);
@@ -182,7 +180,9 @@ static t_job* buscar_job(uint32_t jid) {
   return job;
 }
 
-// Llamar con mutex_jobs tomado
+// Llamar con mutex_jobs tomado. Saca al Job de las estructuras del
+// Planificador; el que llama, ya sin el mutex, tiene que llamar a
+// destruir_job (que le avisa a la Placa: es un pedido de red).
 static void finalizar_job(t_job* job, char* motivo) {
   cambiar_estado(job, EXIT_ESTADO);
   log_info(logger,
@@ -190,10 +190,11 @@ static void finalizar_job(t_job* job, char* motivo) {
            "Tiempo total: %" PRId64 "ms - Tiempo en NEW: %" PRId64
            "ms - Tiempo en READY: "
            "%" PRId64
-           "ms - Memoria máxima: 0 - Syscalls: %d - Page Faults: 0 - "
+           "ms - Memoria máxima: %u bytes - Syscalls: %d - Page Faults: %d - "
            "Transiciones READY-EXEC: %d",
            job->jid, motivo, ms_entre(job->creado, job->ultimo_cambio),
-           job->ms_en_new, job->ms_en_ready, job->syscalls, job->veces_en_exec);
+           job->ms_en_new, job->ms_en_ready, job->memoria_maxima, job->syscalls,
+           job->page_faults, job->veces_en_exec);
 
   t_contexto* c = &job->contexto;
   log_info(logger,
@@ -205,9 +206,68 @@ static void finalizar_job(t_job* job, char* motivo) {
   char* clave = string_itoa(job->jid);
   dictionary_remove(jobs, clave);
   free(clave);
+  jobs_admitidos--;
+}
+
+// Llamar SIN mutex_jobs: la Placa libera marcos, Offload y tabla de páginas
+static void destruir_job(t_job* job) {
+  finalizar_job_en_placa(job->jid);
+  dictionary_destroy_and_destroy_elements(job->asignaciones, free);
   free(job->archivo_pseudocodigo);
   free(job);
-  jobs_admitidos--;
+}
+
+// Campos de un mensaje armado con agregar_a_paquete. NULL si se cortó la
+// conexión o llegaron menos campos de los esperados.
+static t_list* recibir_campos(int fd_conexion, int esperados) {
+  int size;
+  void* buffer = recibir_buffer(&size, fd_conexion);
+  if (buffer == NULL) return NULL;
+  t_list* campos = deserializar_paquete(buffer, size);
+  free(buffer);
+  if (list_size(campos) < esperados) {
+    list_destroy_and_destroy_elements(campos, free);
+    return NULL;
+  }
+  return campos;
+}
+
+static uint32_t campo_u32(t_list* campos, int indice) {
+  return *(uint32_t*)list_get(campos, indice);
+}
+
+static void registrar_syscall(uint32_t jid, char* nombre) {
+  pthread_mutex_lock(&mutex_jobs);
+  t_job* job = buscar_job(jid);
+  if (job != NULL) job->syscalls++;
+  log_info(logger, "## (%u) - Solicitó syscall: %s", jid, nombre);
+  pthread_mutex_unlock(&mutex_jobs);
+}
+
+void desbloquear_job(uint32_t jid) {
+  pthread_mutex_lock(&mutex_jobs);
+  t_job* job = buscar_job(jid);
+  if (job != NULL && job->estado == BLOCKED) {
+    cambiar_estado(job, READY);
+    queue_push(cola_ready, job);
+  }
+  pthread_mutex_unlock(&mutex_jobs);
+  corto_plazo();
+}
+
+typedef struct {
+  uint32_t jid;
+  uint32_t nro_pagina;
+} t_page_fault;
+
+// Un hilo por Page Fault: así el hilo que atiende al Core no queda esperando
+// a la Placa (y al Offload) y el Core puede recibir otro Job enseguida
+static void* atender_page_fault(void* arg) {
+  t_page_fault* page_fault = arg;
+  cargar_pagina_en_placa(page_fault->jid, page_fault->nro_pagina);
+  desbloquear_job(page_fault->jid);
+  free(page_fault);
+  return NULL;
 }
 
 static void atender_consultar_interrupcion(int fd_conexion) {
@@ -241,6 +301,8 @@ static void atender_devolver_job(int fd_conexion, t_core* core) {
   t_contexto* contexto = list_get(campos, 1);
   uint8_t motivo = *(uint8_t*)list_get(campos, 2);
 
+  t_job* finalizado = NULL;
+  t_page_fault* page_fault = NULL;
   pthread_mutex_lock(&mutex_jobs);
   t_job* job = buscar_job(jid);
   if (job != NULL) {
@@ -249,7 +311,17 @@ static void atender_devolver_job(int fd_conexion, t_core* core) {
       job->syscalls++;
       log_info(logger, "## (%u) - Solicitó syscall: EXIT", jid);
       finalizar_job(job, "EXIT");
-    } else {
+      finalizado = job;
+    } else if (motivo == FIN_ERROR) {  // ALLOC sin lugar en el Offload
+      finalizar_job(job, "OUT_OF_MEMORY");
+      finalizado = job;
+    } else if (motivo == PAGE_FAULT) {
+      job->page_faults++;
+      cambiar_estado(job, BLOCKED);
+      page_fault = malloc(sizeof(t_page_fault));
+      page_fault->jid = jid;
+      page_fault->nro_pagina = *(uint32_t*)list_get(campos, 3);
+    } else {  // FIN_QUANTUM
       cambiar_estado(job, READY);
       queue_push(cola_ready, job);
     }
@@ -263,7 +335,121 @@ static void atender_devolver_job(int fd_conexion, t_core* core) {
   list_destroy_and_destroy_elements(campos, free);
   free(buffer);
 
+  if (finalizado != NULL) destruir_job(finalizado);
+  if (page_fault != NULL) {
+    pthread_t hilo;
+    pthread_create(&hilo, NULL, atender_page_fault, page_fault);
+    pthread_detach(hilo);
+  }
   largo_plazo();
+  corto_plazo();
+}
+
+// ALLOC: no bloquea. Se deriva a la Placa y se le contesta al Core.
+static void atender_alloc(int fd_conexion) {
+  t_list* campos = recibir_campos(fd_conexion, 2);
+  if (campos == NULL) return;
+  uint32_t jid = campo_u32(campos, 0);
+  uint32_t tamanio = campo_u32(campos, 1);
+  list_destroy_and_destroy_elements(campos, free);
+
+  registrar_syscall(jid, "ALLOC");
+  uint32_t dir_logica = 0;
+  uint8_t ok = asignar_espacio_en_placa(jid, tamanio, &dir_logica);
+  if (ok) {
+    pthread_mutex_lock(&mutex_jobs);
+    t_job* job = buscar_job(jid);
+    if (job != NULL) {
+      uint32_t* guardado = malloc(sizeof(uint32_t));
+      *guardado = tamanio;
+      char* clave = string_itoa(dir_logica);
+      dictionary_put(job->asignaciones, clave, guardado);
+      free(clave);
+      job->memoria_actual += tamanio;
+      if (job->memoria_actual > job->memoria_maxima)
+        job->memoria_maxima = job->memoria_actual;
+    }
+    pthread_mutex_unlock(&mutex_jobs);
+  }
+  // Si no hubo lugar (ok = 0) el Core devuelve el Job con FIN_ERROR
+  t_paquete* paquete = crear_paquete(RESPUESTA_ALLOC);
+  agregar_a_paquete(paquete, &ok, sizeof(uint8_t));
+  agregar_a_paquete(paquete, &dir_logica, sizeof(uint32_t));
+  enviar_paquete(paquete, fd_conexion);
+  eliminar_paquete(paquete);
+}
+
+// FREE: no bloquea
+static void atender_free(int fd_conexion) {
+  t_list* campos = recibir_campos(fd_conexion, 2);
+  if (campos == NULL) return;
+  uint32_t jid = campo_u32(campos, 0);
+  uint32_t dir_logica = campo_u32(campos, 1);
+  list_destroy_and_destroy_elements(campos, free);
+
+  registrar_syscall(jid, "FREE");
+  liberar_espacio_en_placa(jid, dir_logica);
+
+  pthread_mutex_lock(&mutex_jobs);
+  t_job* job = buscar_job(jid);
+  if (job != NULL) {
+    char* clave = string_itoa(dir_logica);
+    uint32_t* tamanio = dictionary_remove(job->asignaciones, clave);
+    free(clave);
+    if (tamanio != NULL) job->memoria_actual -= *tamanio;
+    free(tamanio);
+  }
+  pthread_mutex_unlock(&mutex_jobs);
+  enviar_ack(fd_conexion);
+}
+
+static char* nombre_syscall(uint8_t tipo) {
+  char* nombres[] = {"LOAD_BATCH",      "LABEL",           "REPORT",
+                     "SAVE_CHECKPOINT", "LOAD_CHECKPOINT", "DELETE_CHECKPOINT"};
+  return tipo <= SYS_DELETE_CHECKPOINT ? nombres[tipo] : "DESCONOCIDA";
+}
+// LOAD_BATCH / LABEL / REPORT (y Checkpoints): el Job se bloquea, el Core
+// queda libre y el pedido va a la cola del servicio
+static void atender_syscall_bloqueante(int fd_conexion, t_core* core) {
+  t_list* campos = recibir_campos(fd_conexion, 7);
+  if (campos == NULL) return;
+  t_pedido_servicio* pedido = malloc(sizeof(t_pedido_servicio));
+  pedido->jid = campo_u32(campos, 0);
+  t_contexto* contexto = list_get(campos, 1);
+  pedido->tipo = *(uint8_t*)list_get(campos, 2);
+  pedido->nombre = strdup(list_get(campos, 3));
+  pedido->tamanio = campo_u32(campos, 4);
+  pedido->cant_pares = campo_u32(campos, 5);
+  pedido->pares = malloc(sizeof(t_par_fisico) * (pedido->cant_pares + 1));
+  memcpy(pedido->pares, list_get(campos, 6),
+         sizeof(t_par_fisico) * pedido->cant_pares);
+
+  pthread_mutex_lock(&mutex_jobs);
+  t_job* job = buscar_job(pedido->jid);
+  if (job != NULL) {
+    job->contexto = *contexto;  // el PC ya apunta a la instrucción siguiente
+    job->syscalls++;
+    log_info(logger, "## (%u) - Solicitó syscall: %s", pedido->jid,
+             nombre_syscall(pedido->tipo));
+    cambiar_estado(job, BLOCKED);
+  }
+  if (core != NULL) {
+    core->libre = true;
+    core->job = NULL;
+  }
+  pthread_mutex_unlock(&mutex_jobs);
+  list_destroy_and_destroy_elements(campos, free);
+
+  if (pedido->tipo >= SYS_SAVE_CHECKPOINT) {
+    // Check 4: todavía no hay Storage. El Job sigue como si hubiera terminado.
+    log_warning(logger, "## (%u) - %s se implementa en el Check 4", pedido->jid,
+                nombre_syscall(pedido->tipo));
+    deslockear_paginas_en_placa(pedido->jid);
+    desbloquear_job(pedido->jid);
+    destruir_pedido_servicio(pedido);
+  } else {
+    encolar_pedido_servicio(pedido);
+  }
   corto_plazo();
 }
 
@@ -289,17 +475,22 @@ static void atender_init_job(int fd_conexion) {
   enviar_ack(fd_conexion);  // no bloquea: el Core sigue con el mismo Job
 }
 
-// El Core se desconectó: su Job vuelve a READY y el Core sale de la lista
+// El Core se desconectó: el Core sale de la lista, se deslockean las páginas
+// de su Job y el Job vuelve a READY
 static void desconectar_core(t_core* core) {
   pthread_mutex_lock(&mutex_jobs);
-  if (core->job != NULL) {
-    cambiar_estado(core->job, READY);
-    queue_push(cola_ready, core->job);
-  }
+  t_job* job = core->job;
   list_remove_element(cores, core);
   pthread_mutex_unlock(&mutex_jobs);
   free(core);
 
+  if (job != NULL) {
+    deslockear_paginas_en_placa(job->jid);  // pedido a la Placa: sin mutex
+    pthread_mutex_lock(&mutex_jobs);
+    cambiar_estado(job, READY);
+    queue_push(cola_ready, job);
+    pthread_mutex_unlock(&mutex_jobs);
+  }
   corto_plazo();
 }
 
@@ -343,6 +534,18 @@ void atender_conexion(int fd_conexion) {
         atender_init_job(fd_conexion);
         break;
       }
+      case SOLICITUD_ALLOC: {
+        atender_alloc(fd_conexion);
+        break;
+      }
+      case SOLICITUD_FREE: {
+        atender_free(fd_conexion);
+        break;
+      }
+      case SYSCALL_BLOQUEANTE: {
+        atender_syscall_bloqueante(fd_conexion, core);
+        break;
+      }
       default: {
         // Siempre se consume el buffer, si no el socket queda desfasado
         int size;
@@ -381,14 +584,18 @@ int main(int argc, char* argv[]) {
 
   // Cliente de Placa y Storage (la consigna pide conectarse a ambos ANTES de
   // levantar el servidor propio)
-  fd_placa = crear_conexion(config_get_string_value(config, "IP_PLACA"),
-                            config_get_string_value(config, "PUERTO_PLACA"));
+  int fd_placa =
+      crear_conexion(config_get_string_value(config, "IP_PLACA"),
+                     config_get_string_value(config, "PUERTO_PLACA"));
   enviar_handshake(fd_placa, "PLANIFICADOR");
+  placa_iniciar(fd_placa);  // Check 3: el fd lo maneja placa_cliente.c
 
   int fd_storage =
       crear_conexion(config_get_string_value(config, "IP_STORAGE"),
                      config_get_string_value(config, "PUERTO_STORAGE"));
   enviar_handshake(fd_storage, "PLANIFICADOR");
+
+  servicios_iniciar(config);  // Check 3: hilos de Loader, Labeler y Logger
 
   // Job inicial (JID 0)
   crear_job(argv[2]);
