@@ -15,6 +15,87 @@
 
 t_log* logger;
 
+// ---------- Check 4: pedidos del Planificador ----------
+
+// Campos de un pedido armado con agregar_a_paquete. NULL si se cortó la
+// conexión o llegaron menos campos de los esperados.
+static t_list* recibir_campos(int fd_conexion, int esperados) {
+  int size;
+  void* buffer = recibir_buffer(&size, fd_conexion);
+  if (buffer == NULL) return NULL;
+  t_list* campos = deserializar_paquete(buffer, size);
+  free(buffer);
+  if (list_size(campos) < esperados) {
+    list_destroy_and_destroy_elements(campos, free);
+    return NULL;
+  }
+  return campos;
+}
+
+// RESPUESTA_CHECKPOINT: resultado, tamaño y contenido. El contenido solo va
+// lleno en una carga que salió bien; en el resto, tamaño 0 y vacío.
+static void responder(int fd_conexion, t_resultado_checkpoint resultado,
+                      void* contenido, uint32_t tamanio) {
+  uint8_t codigo = resultado;
+  t_paquete* paquete = crear_paquete(RESPUESTA_CHECKPOINT);
+  agregar_a_paquete(paquete, &codigo, sizeof(uint8_t));
+  agregar_a_paquete(paquete, &tamanio, sizeof(uint32_t));
+  agregar_a_paquete(paquete, contenido != NULL ? contenido : "", tamanio);
+  enviar_paquete(paquete, fd_conexion);
+  eliminar_paquete(paquete);
+}
+
+// GUARDAR_CHECKPOINT: nombre + tamaño + contenido
+static void atender_guardar(int fd_conexion) {
+  t_list* campos = recibir_campos(fd_conexion, 3);
+  if (campos == NULL) return;
+  char* nombre = list_get(campos, 0);
+  uint32_t tamanio = *(uint32_t*)list_get(campos, 1);
+  log_info(logger, "## Solicitud Guardar Checkpoint: %s", nombre);
+  t_resultado_checkpoint resultado =
+      fs_guardar(nombre, list_get(campos, 2), tamanio);
+  if (resultado == CHECKPOINT_OK)
+    log_info(logger, "## Guardado Checkpoint: %s - Tamaño: %u completada",
+             nombre, tamanio);
+  responder(fd_conexion, resultado, NULL, 0);
+  list_destroy_and_destroy_elements(campos, free);
+}
+
+// CARGAR_CHECKPOINT: nombre. Responde el contenido completo.
+static void atender_cargar(int fd_conexion) {
+  t_list* campos = recibir_campos(fd_conexion, 1);
+  if (campos == NULL) return;
+  char* nombre = list_get(campos, 0);
+  log_info(logger, "## Solicitud Cargar Checkpoint: %s", nombre);
+  void* contenido = NULL;
+  uint32_t tamanio = 0;
+  t_resultado_checkpoint resultado = fs_cargar(nombre, &contenido, &tamanio);
+  if (resultado == CHECKPOINT_OK)
+    log_info(logger, "## Carga Checkpoint: %s - Tamaño: %u completada", nombre,
+             tamanio);
+  responder(fd_conexion, resultado, contenido, tamanio);
+  free(contenido);
+  list_destroy_and_destroy_elements(campos, free);
+}
+
+// ELIMINAR_CHECKPOINT: nombre
+static void atender_eliminar(int fd_conexion) {
+  t_list* campos = recibir_campos(fd_conexion, 1);
+  if (campos == NULL) return;
+  char* nombre = list_get(campos, 0);
+  log_info(logger, "## Solicitud Eliminacion Checkpoint: %s", nombre);
+  uint32_t tamanio = 0;
+  t_resultado_checkpoint resultado = fs_eliminar(nombre, &tamanio);
+  if (resultado == CHECKPOINT_OK)
+    log_info(logger, "## Eliminacion Checkpoint: %s - Tamaño: %u completada",
+             nombre, tamanio);
+  responder(fd_conexion, resultado, NULL, 0);
+  list_destroy_and_destroy_elements(campos, free);
+}
+
+// Un hilo por conexión (escuchar_conexiones). Los pedidos de distintas
+// conexiones pueden llegar a la vez: el volumen y el journal los protege
+// mutex_fs adentro de fs.c.
 void atender_conexion(int fd_conexion) {
   int operacion = recibir_operacion(fd_conexion);
   while (operacion != -1) {
@@ -31,6 +112,15 @@ void atender_conexion(int fd_conexion) {
         free(mensaje);
         break;
       }
+      case GUARDAR_CHECKPOINT:
+        atender_guardar(fd_conexion);
+        break;
+      case CARGAR_CHECKPOINT:
+        atender_cargar(fd_conexion);
+        break;
+      case ELIMINAR_CHECKPOINT:
+        atender_eliminar(fd_conexion);
+        break;
       default: {
         // Siempre se consume el buffer, si no el socket queda desfasado
         int size;
@@ -43,6 +133,8 @@ void atender_conexion(int fd_conexion) {
   }
   cerrar_conexion(fd_conexion);
 }
+
+// ---------- Consola ----------
 
 static int valor_hexa(char caracter) {
   if (isdigit((unsigned char)caracter)) return caracter - '0';
@@ -70,7 +162,7 @@ static void comando_write(char* nombre, char* hexa) {
     }
     bytes[i] = alto * 16 + bajo;
   }
-  if (fs_guardar(nombre, bytes, largo / 2) == FS_OK)
+  if (fs_guardar(nombre, bytes, largo / 2) == CHECKPOINT_OK)
     printf("WRITE: %s guardado (%zu bytes)\n", nombre, largo / 2);
 }
 
@@ -92,7 +184,7 @@ static void* consola(void* arg) {
     } else if (strcmp(tokens[0], "WRITE") == 0 && cantidad == 3) {
       comando_write(tokens[1], tokens[2]);
     } else if (strcmp(tokens[0], "RM") == 0 && cantidad == 2) {
-      if (fs_eliminar(tokens[1]) == FS_OK)
+      if (fs_eliminar(tokens[1], NULL) == CHECKPOINT_OK)
         printf("RM: %s borrado\n", tokens[1]);
       else
         printf("RM: no existe %s\n", tokens[1]);
@@ -121,7 +213,7 @@ int main(int argc, char* argv[]) {
       "storage.log", "Storage", 1,
       log_level_from_string(config_get_string_value(config, "LOG_LEVEL")));
 
-  fs_iniciar(config);  // Check 3: monta o formatea el volumen
+  fs_iniciar(config);  // monta o formatea el volumen y recupera el journal
 
   // Sin esto, readline se queda con las señales: Ctrl+C y kill no cortan el
   // proceso mientras la consola espera una línea

@@ -1,7 +1,8 @@
 #ifndef UTILS_SRC_UTILS_CONEXION_H_
 #define UTILS_SRC_UTILS_CONEXION_H_
 
-int crear_conexion(char* ip, char* puerto);  // cliente: socket + connect
+int crear_conexion(char* ip,
+                   char* puerto);  // cliente: socket + connect. -1 si falla
 int iniciar_servidor(
     char* puerto);  // servidor: socket + bind + listen, devuelve fd de escucha
 int esperar_cliente(

@@ -12,10 +12,14 @@ int crear_conexion(char* ip, char* puerto) {
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
 
-  getaddrinfo(ip, puerto, &hints, &server_info);
+  if (getaddrinfo(ip, puerto, &hints, &server_info) != 0) return -1;
   int fd = socket(server_info->ai_family, server_info->ai_socktype,
                   server_info->ai_protocol);
-  connect(fd, server_info->ai_addr, server_info->ai_addrlen);
+  if (fd >= 0 &&
+      connect(fd, server_info->ai_addr, server_info->ai_addrlen) != 0) {
+    close(fd);  // el servidor no está levantado
+    fd = -1;
+  }
   freeaddrinfo(server_info);
   return fd;
 }
