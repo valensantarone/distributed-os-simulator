@@ -7,7 +7,6 @@
 
 #include "placa_cliente.h"
 #include "planificador.h"
-#include "storage_cliente.h"
 
 // El rango del pedido, pedazo por pedazo (un par por página)
 static void leer_rango(t_pedido_servicio* pedido, uint8_t* destino) {

@@ -29,6 +29,7 @@ typedef struct {
   t_contexto contexto;
   char* archivo_pseudocodigo;
   struct timespec inicio_rafaga;  // cuándo se le asignó el Core (para RR)
+  double estimacion;              // estimación actual de ráfaga en ms (HRRN)
   // Estadísticas
   struct timespec creado;         // cuándo entró a NEW
   struct timespec ultimo_cambio;  // cuándo entró al estado actual
@@ -50,15 +51,17 @@ typedef struct {
 
 t_log* logger;
 
-typedef enum { ALG_FIFO, ALG_RR } t_algoritmo;
+typedef enum { ALG_FIFO, ALG_RR, ALG_HRRN } t_algoritmo;
 
 t_algoritmo algoritmo;
-int rr_quantum;  // ms
+int rr_quantum;             // ms
+double estimacion_inicial;  // ms (HRRN)
+double hrrn_alfa;
 int grado_multiprogramacion;
 
 t_dictionary* jobs;  // JID (string) -> t_job*
 t_queue* cola_new;
-t_queue* cola_ready;
+t_list* cola_ready;
 t_list* cores;  // t_core*
 uint32_t proximo_jid = 0;
 int jobs_admitidos = 0;  // Jobs en READY, EXEC o BLOCKED
@@ -68,6 +71,11 @@ pthread_mutex_t mutex_jobs =
 static int64_t ms_entre(struct timespec desde, struct timespec hasta) {
   return (hasta.tv_sec - desde.tv_sec) * 1000 +
          (hasta.tv_nsec - desde.tv_nsec) / 1000000;
+}
+
+static double ms_reales_entre(struct timespec desde, struct timespec hasta) {
+  return (double)(hasta.tv_sec - desde.tv_sec) * 1000.0 +
+         (double)(hasta.tv_nsec - desde.tv_nsec) / 1000000.0;
 }
 
 static struct timespec ahora(void) {
@@ -112,7 +120,7 @@ static void largo_plazo(void) {
          !queue_is_empty(cola_new)) {
     t_job* job = queue_pop(cola_new);
     cambiar_estado(job, READY);
-    queue_push(cola_ready, job);
+    list_add(cola_ready, job);
     jobs_admitidos++;
   }
   pthread_mutex_unlock(&mutex_jobs);
@@ -120,16 +128,51 @@ static void largo_plazo(void) {
 
 static bool core_esta_libre(void* core) { return ((t_core*)core)->libre; }
 
+// Llamar con mutex_jobs tomado cuando el Job deja EXEC sin terminar
+static void actualizar_estimacion(t_job* job) {
+  if (algoritmo != ALG_HRRN) return;
+  double rafaga_real = ms_reales_entre(job->inicio_rafaga, ahora());
+  job->estimacion =
+      hrrn_alfa * rafaga_real + (1.0 - hrrn_alfa) * job->estimacion;
+}
+
+// Llamar con mutex_jobs tomado y cola_ready no vacía
+static t_job* elegir_proximo_ready(void) {
+  if (algoritmo != ALG_HRRN) return list_remove(cola_ready, 0);
+
+  struct timespec t = ahora();
+  int mejor_indice = 0;
+  double mejor_prioridad = -1.0;
+
+  for (int i = 0; i < list_size(cola_ready); i++) {
+    t_job* job = list_get(cola_ready, i);
+    double espera = ms_reales_entre(job->ultimo_cambio, t);
+    double estimacion = job->estimacion > 0.0 ? job->estimacion : 1.0;
+    double prioridad = 1.0 + espera / estimacion;
+
+    log_info(logger,
+             "## (%u) - Prioridad HRRN calculada: %.2f - Estimación próxima "
+             "ráfaga: %.2f",
+             job->jid, prioridad, job->estimacion);
+
+    if (prioridad > mejor_prioridad) {
+      mejor_prioridad = prioridad;
+      mejor_indice = i;
+    }
+  }
+  return list_remove(cola_ready, mejor_indice);
+}
+
 // Corto plazo: READY -> EXEC mientras haya un Core libre.
-// FIFO y RR eligen igual (el primero de la cola); cambia cuándo se desaloja.
+// FIFO y RR toman el primero; HRRN elige el de mayor response ratio (1 + W/S).
 // NUNCA llamar con mutex_jobs tomado.
 static void corto_plazo(void) {
   pthread_mutex_lock(&mutex_jobs);
-  while (!queue_is_empty(cola_ready)) {
+  while (!list_is_empty(cola_ready)) {
     t_core* core = list_find(cores, core_esta_libre);
     if (core == NULL) break;
 
-    t_job* job = queue_pop(cola_ready);
+    t_job* job = elegir_proximo_ready();
     cambiar_estado(job, EXEC);
     job->inicio_rafaga = ahora();
     core->libre = false;
@@ -159,6 +202,7 @@ static void crear_job(char* archivo) {
   job->creado = ahora();
   job->ultimo_cambio = job->creado;
   job->asignaciones = dictionary_create();
+  job->estimacion = estimacion_inicial;
 
   pthread_mutex_lock(&mutex_jobs);
   char* clave = string_itoa(jid);
@@ -249,7 +293,7 @@ void desbloquear_job(uint32_t jid) {
   t_job* job = buscar_job(jid);
   if (job != NULL && job->estado == BLOCKED) {
     cambiar_estado(job, READY);
-    queue_push(cola_ready, job);
+    list_add(cola_ready, job);
   }
   pthread_mutex_unlock(&mutex_jobs);
   corto_plazo();
@@ -317,13 +361,14 @@ static void atender_devolver_job(int fd_conexion, t_core* core) {
       finalizado = job;
     } else if (motivo == PAGE_FAULT) {
       job->page_faults++;
+      actualizar_estimacion(job);
       cambiar_estado(job, BLOCKED);
       page_fault = malloc(sizeof(t_page_fault));
       page_fault->jid = jid;
       page_fault->nro_pagina = *(uint32_t*)list_get(campos, 3);
     } else {  // FIN_QUANTUM
       cambiar_estado(job, READY);
-      queue_push(cola_ready, job);
+      list_add(cola_ready, job);
     }
   }
   if (core != NULL) {
@@ -431,6 +476,7 @@ static void atender_syscall_bloqueante(int fd_conexion, t_core* core) {
     job->syscalls++;
     log_info(logger, "## (%u) - Solicitó syscall: %s", pedido->jid,
              nombre_syscall(pedido->tipo));
+    actualizar_estimacion(job);
     cambiar_estado(job, BLOCKED);
   }
   if (core != NULL) {
@@ -487,8 +533,9 @@ static void desconectar_core(t_core* core) {
   if (job != NULL) {
     deslockear_paginas_en_placa(job->jid);  // pedido a la Placa: sin mutex
     pthread_mutex_lock(&mutex_jobs);
+    actualizar_estimacion(job);
     cambiar_estado(job, READY);
-    queue_push(cola_ready, job);
+    list_add(cola_ready, job);
     pthread_mutex_unlock(&mutex_jobs);
   }
   corto_plazo();
@@ -572,14 +619,23 @@ int main(int argc, char* argv[]) {
 
   char* nombre_algoritmo =
       config_get_string_value(config, "ALGORITMO_PLANIFICACION");
-  algoritmo = strcmp(nombre_algoritmo, "RR") == 0 ? ALG_RR : ALG_FIFO;
+  if (strcmp(nombre_algoritmo, "RR") == 0)
+    algoritmo = ALG_RR;
+  else if (strcmp(nombre_algoritmo, "HRRN") == 0)
+    algoritmo = ALG_HRRN;
+  else
+    algoritmo = ALG_FIFO;
   rr_quantum = config_get_int_value(config, "RR_QUANTUM");
+  if (config_has_property(config, "ESTIMACION_INICIAL"))
+    estimacion_inicial = config_get_double_value(config, "ESTIMACION_INICIAL");
+  if (config_has_property(config, "HRRN_ALFA"))
+    hrrn_alfa = config_get_double_value(config, "HRRN_ALFA");
   grado_multiprogramacion =
       config_get_int_value(config, "GRADO_MULTIPROGRAMACION");
 
   jobs = dictionary_create();
   cola_new = queue_create();
-  cola_ready = queue_create();
+  cola_ready = list_create();
   cores = list_create();
 
   // Cliente de Placa y Storage (la consigna pide conectarse a ambos ANTES de
