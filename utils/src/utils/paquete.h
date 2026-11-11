@@ -31,8 +31,24 @@ typedef enum {
   SOLICITUD_ALLOC = 23,    // Core -> Planif.: jid + tamaño
   RESPUESTA_ALLOC = 24,    // Planif. -> Core y Placa -> Planif.: ok + dir
   SOLICITUD_FREE = 25,     // Core -> Planif.: jid + dir_logica. Resp. ACK
-  SYSCALL_BLOQUEANTE = 26  // Core -> Planif.: jid + contexto + parámetros
+  SYSCALL_BLOQUEANTE = 26,  // Core -> Planif.: jid + contexto + parámetros
+  // Check 4: Checkpoints (Planificador <-> Storage)
+  GUARDAR_CHECKPOINT = 27,   // Planif. -> Storage: nombre + tamaño + contenido
+  CARGAR_CHECKPOINT = 28,    // Planif. -> Storage: nombre
+  ELIMINAR_CHECKPOINT = 29,  // Planif. -> Storage: nombre
+  RESPUESTA_CHECKPOINT = 30  // Storage -> Planif.: resultado + datos
 } op_code;
+
+// Resultado de un pedido al Storage. Viaja como uint8_t en
+// RESPUESTA_CHECKPOINT. CHECKPOINT_SIN_CONEXION no lo manda nadie: lo usa el
+// Planificador cuando el Storage no responde.
+typedef enum {
+  CHECKPOINT_OK = 0,
+  CHECKPOINT_SIN_ESPACIO = 1,  // no alcanzan los bloques libres
+  CHECKPOINT_DIRECTORIO_LLENO = 2,
+  CHECKPOINT_NO_EXISTE = 3,
+  CHECKPOINT_SIN_CONEXION = 4
+} t_resultado_checkpoint;
 
 typedef enum {
   FIN_QUANTUM = 0,

@@ -56,7 +56,9 @@ t_list* deserializar_paquete(void* buffer, int size) {
 void enviar_paquete(t_paquete* paquete, int fd_conexion) {
   int bytes;
   void* a_enviar = serializar_paquete(paquete, &bytes);
-  send(fd_conexion, a_enviar, bytes, 0);
+  // MSG_NOSIGNAL: si del otro lado se cayeron, send devuelve -1 en vez de
+  // matar a este proceso con SIGPIPE
+  send(fd_conexion, a_enviar, bytes, MSG_NOSIGNAL);
   free(a_enviar);
 }
 
