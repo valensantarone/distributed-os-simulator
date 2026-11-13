@@ -16,6 +16,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "recuperacion.h"
+
 extern t_log* logger;
 
 #define FIRMA "FAT32_TRAIN"
@@ -33,28 +35,8 @@ typedef struct __attribute__((packed)) {
   uint32_t bloques_directorio;
 } t_superbloque;
 
-typedef struct __attribute__((packed)) {
-  uint8_t estado;  // 0 libre, 1 ocupada
-  char nombre[23];
-  uint32_t tamanio;
-  uint32_t primer_bloque;
-} t_entrada_directorio;
-
 _Static_assert(sizeof(t_superbloque) == 23, "superbloque de 23 bytes");
 _Static_assert(sizeof(t_entrada_directorio) == 32, "entrada de 32 bytes");
-
-// Una modificación del volumen. Guardar y eliminar arman una lista de estas y
-// después la aplican entera. En el Check 4 esa lista es el asiento del
-// journal: se escribe en el journal, se hace commit y recién ahí se aplica.
-typedef enum { MOD_DIRECTORIO, MOD_FAT, MOD_BLOQUE } t_tipo_modificacion;
-
-typedef struct {
-  t_tipo_modificacion tipo;
-  uint32_t indice;  // nro de entrada de directorio, de entrada FAT o de bloque
-  uint32_t valor;   // MOD_FAT: el valor nuevo de la entrada
-  t_entrada_directorio entrada;  // MOD_DIRECTORIO: cómo queda la entrada
-  void* datos;                   // MOD_BLOQUE: tam_bloque bytes
-} t_modificacion;
 
 static void* volumen;  // el archivo entero, mapeado con mmap
 static size_t tam_volumen;
@@ -66,7 +48,13 @@ static uint32_t primer_bloque_directorio;
 static uint32_t primer_bloque_datos;
 static uint32_t cant_entradas;
 static int retardo_bloque;
+static int retardo_commit;
 static pthread_mutex_t mutex_fs = PTHREAD_MUTEX_INITIALIZER;
+
+// Check 4: el journal es un archivo de texto aparte del volumen
+// (PATH_STORAGE/journal.txt). Solo se le agregan líneas al final.
+static FILE* journal;
+static uint32_t proximo_asiento = 1;
 
 // Bloques que la operación en curso ya leyó y ya escribió: el retardo se paga
 // una vez por bloque distinto, aunque se usen varias entradas del mismo bloque
@@ -213,9 +201,195 @@ static void formatear(void) {
            cant_entradas, primer_bloque_datos);
 }
 
+// ---------- Planes de modificaciones ----------
+
+t_modificacion* nueva_modificacion(t_tipo_modificacion tipo, uint32_t indice) {
+  t_modificacion* modificacion = calloc(1, sizeof(t_modificacion));
+  modificacion->tipo = tipo;
+  modificacion->indice = indice;
+  return modificacion;
+}
+
+static void agregar_fat(t_list* plan, uint32_t entrada, uint32_t valor) {
+  t_modificacion* modificacion = nueva_modificacion(MOD_FAT, entrada);
+  modificacion->valor = valor;
+  list_add(plan, modificacion);
+}
+
+static void agregar_directorio(t_list* plan, uint32_t indice,
+                               t_entrada_directorio entrada) {
+  t_modificacion* modificacion = nueva_modificacion(MOD_DIRECTORIO, indice);
+  modificacion->entrada = entrada;
+  list_add(plan, modificacion);
+}
+
+static void agregar_bloque(t_list* plan, uint32_t nro, void* datos,
+                           uint32_t tamanio) {
+  t_modificacion* modificacion = nueva_modificacion(MOD_BLOQUE, nro);
+  modificacion->datos = calloc(1, tam_bloque);  // el resto queda en 0
+  memcpy(modificacion->datos, datos, tamanio);
+  list_add(plan, modificacion);
+}
+
+void destruir_modificacion(void* elemento) {
+  t_modificacion* modificacion = elemento;
+  free(modificacion->datos);
+  free(modificacion);
+}
+
+// Paso 2 del journaling: escribe el plan en el volumen. Sin msync: la consigna
+// deja opcional sincronizar en este paso, y con mmap lo escrito ya está en la
+// memoria del sistema operativo, que sobrevive a que maten al Storage.
+static void aplicar(t_list* plan, char* nombre) {
+  for (int i = 0; i < list_size(plan); i++) {
+    t_modificacion* modificacion = list_get(plan, i);
+    switch (modificacion->tipo) {
+      case MOD_DIRECTORIO:
+        acceder(bloques_escritos, bloque_de_directorio(modificacion->indice));
+        directorio()[modificacion->indice] = modificacion->entrada;
+        break;
+      case MOD_FAT:
+        fat_escribir(modificacion->indice, modificacion->valor);
+        break;
+      case MOD_BLOQUE:
+        bloque_escribir(modificacion->indice, modificacion->datos, nombre);
+        break;
+    }
+  }
+}
+
+// ---------- Journal ----------
+
+// Una modificación como línea de texto: así va al journal y al log. La
+// inversa, texto_a_modificacion, está en recuperacion.c: si se cambia un
+// formato, hay que cambiar los dos.
+static char* modificacion_a_texto(t_modificacion* modificacion) {
+  switch (modificacion->tipo) {
+    case MOD_DIRECTORIO:
+      if (modificacion->entrada.estado == 0)
+        return string_from_format("OP_DIR: Directorio %u - Libre",
+                                  modificacion->indice);
+      return string_from_format(
+          "OP_DIR: Directorio %u - Checkpoint \"%.22s\" - Tamaño %u - Bloque "
+          "Inicial 0x%08X",
+          modificacion->indice, modificacion->entrada.nombre,
+          modificacion->entrada.tamanio, modificacion->entrada.primer_bloque);
+    case MOD_FAT:
+      return string_from_format("OP_FAT: Entrada 0x%08X -> Valor 0x%08X",
+                                modificacion->indice, modificacion->valor);
+    case MOD_BLOQUE: {
+      // El contenido del bloque entero, en hexa (la consigna sugiere hexa)
+      char* texto = string_from_format("OP_WRITE: Bloque 0x%08X - Contenido: ",
+                                       modificacion->indice);
+      for (uint32_t i = 0; i < tam_bloque; i++)
+        string_append_with_format(&texto, "%02X",
+                                  ((uint8_t*)modificacion->datos)[i]);
+      return texto;
+    }
+  }
+  return NULL;
+}
+
+// fwrite + fflush + fsync: cuando vuelve, el texto ya está en el disco y no
+// solo en un buffer del proceso o del sistema operativo
+static void escribir_journal(char* texto) {
+  fwrite(texto, 1, strlen(texto), journal);
+  fflush(journal);
+  fsync(fileno(journal));
+}
+
+// "RECORD_COMMITED 3" / "RECORD_APPLIED 3"
+static void marcar(uint32_t id, char* marca, char* nombre_marca) {
+  char* linea = string_from_format("%s %u\n", marca, id);
+  escribir_journal(linea);
+  free(linea);
+  log_info(logger, "## Nueva marca en asiento: %u: - %s", id, nombre_marca);
+}
+
+// Paso 1 del journaling: el asiento entero al journal y, después de
+// RETARDO_COMMIT, su marca de commit. Desde el commit la operación sobrevive a
+// una caída: si el Storage muere antes de terminar el paso 2, al arrancar la
+// vuelve a aplicar.
+static uint32_t asentar(t_list* plan) {
+  uint32_t id = proximo_asiento++;
+  log_info(logger, "## Asiento iniciado: %u", id);
+  char* asiento = string_from_format("RECORD_STARTED: %u\n", id);
+  for (int i = 0; i < list_size(plan); i++) {
+    char* linea = modificacion_a_texto(list_get(plan, i));
+    log_info(logger, "## Asiento: %u - Modificacion: %s", id, linea);
+    string_append_with_format(&asiento, "%s\n", linea);
+    free(linea);
+  }
+  escribir_journal(asiento);
+  free(asiento);
+  dormir_ms(retardo_commit);
+  marcar(id, "RECORD_COMMITED", "COMMIT");
+  return id;
+}
+
+// Guardar y eliminar terminan acá: journal, volumen y marca de aplicado.
+// Llamar con mutex_fs tomado.
+static void ejecutar(t_list* plan, char* nombre) {
+  uint32_t id = asentar(plan);
+  aplicar(plan, nombre);
+  marcar(id, "RECORD_APPLIED", "APPLIED");
+}
+
+// ---------- Lo que usa recuperacion.c ----------
+
+uint32_t fs_tam_bloque(void) { return tam_bloque; }
+
+bool modificacion_valida(t_modificacion* modificacion) {
+  switch (modificacion->tipo) {
+    case MOD_DIRECTORIO:
+      return modificacion->indice < cant_entradas;
+    case MOD_FAT:
+      return modificacion->indice < cant_bloques;
+    case MOD_BLOQUE:
+      return modificacion->indice >= primer_bloque_datos &&
+             modificacion->indice < cant_bloques;
+  }
+  return false;
+}
+
+void fs_reaplicar(uint32_t id, t_list* plan, char* nombre) {
+  empezar_operacion();
+  aplicar(plan, nombre);
+  marcar(id, "RECORD_APPLIED", "APPLIED");
+}
+
+// ---------- Arranque del journal ----------
+
+// Abre el journal para agregarle asientos y recupera lo que haya quedado sin
+// aplicar. Con un volumen recién formateado, un journal viejo describe otro
+// volumen: se empieza uno vacío.
+static void iniciar_journal(char* path_storage, bool volumen_nuevo) {
+  char* path = string_ends_with(path_storage, "/")
+                   ? string_from_format("%sjournal.txt", path_storage)
+                   : string_from_format("%s/journal.txt", path_storage);
+  journal = fopen(path, volumen_nuevo ? "w" : "a+");
+  if (journal == NULL) {
+    log_error(logger, "No se pudo abrir el journal %s", path);
+    exit(EXIT_FAILURE);
+  }
+  // Si lo mataron a mitad de una línea, lo que siga va en una línea nueva
+  fseek(journal, 0, SEEK_END);
+  long tamanio = ftell(journal);
+  bool cortado = false;
+  if (tamanio > 0) {
+    fseek(journal, tamanio - 1, SEEK_SET);
+    cortado = fgetc(journal) != '\n';
+    fseek(journal, 0, SEEK_END);  // entre leer y escribir va un fseek
+  }
+  if (cortado) escribir_journal("\n");
+  if (!volumen_nuevo) proximo_asiento = recuperar(path) + 1;
+  free(path);
+}
+
 void fs_iniciar(t_config* config) {
   char* path_storage = config_get_string_value(config, "PATH_STORAGE");
   retardo_bloque = config_get_int_value(config, "RETARDO_ACCESO_BLOQUE");
+  retardo_commit = config_get_int_value(config, "RETARDO_COMMIT");
   mkdir(path_storage, 0755);  // si ya existe, no pasa nada
   char* path = string_ends_with(path_storage, "/")
                    ? string_from_format("%sfat32_train.dat", path_storage)
@@ -266,65 +440,12 @@ void fs_iniciar(t_config* config) {
   else
     formatear();
   free(path);
+  iniciar_journal(path_storage, !existe);  // Check 4
 }
 
-// ---------- Guardar y eliminar ----------
+// ---------- Guardar, cargar y eliminar ----------
 
-static t_modificacion* nueva_modificacion(t_tipo_modificacion tipo,
-                                          uint32_t indice) {
-  t_modificacion* modificacion = calloc(1, sizeof(t_modificacion));
-  modificacion->tipo = tipo;
-  modificacion->indice = indice;
-  return modificacion;
-}
-
-static void agregar_fat(t_list* plan, uint32_t entrada, uint32_t valor) {
-  t_modificacion* modificacion = nueva_modificacion(MOD_FAT, entrada);
-  modificacion->valor = valor;
-  list_add(plan, modificacion);
-}
-
-static void agregar_directorio(t_list* plan, uint32_t indice,
-                               t_entrada_directorio entrada) {
-  t_modificacion* modificacion = nueva_modificacion(MOD_DIRECTORIO, indice);
-  modificacion->entrada = entrada;
-  list_add(plan, modificacion);
-}
-
-static void agregar_bloque(t_list* plan, uint32_t nro, void* datos,
-                           uint32_t tamanio) {
-  t_modificacion* modificacion = nueva_modificacion(MOD_BLOQUE, nro);
-  modificacion->datos = calloc(1, tam_bloque);  // el resto queda en 0
-  memcpy(modificacion->datos, datos, tamanio);
-  list_add(plan, modificacion);
-}
-
-static void destruir_modificacion(void* elemento) {
-  t_modificacion* modificacion = elemento;
-  free(modificacion->datos);
-  free(modificacion);
-}
-
-static void aplicar(t_list* plan, char* nombre) {
-  for (int i = 0; i < list_size(plan); i++) {
-    t_modificacion* modificacion = list_get(plan, i);
-    switch (modificacion->tipo) {
-      case MOD_DIRECTORIO:
-        acceder(bloques_escritos, bloque_de_directorio(modificacion->indice));
-        directorio()[modificacion->indice] = modificacion->entrada;
-        break;
-      case MOD_FAT:
-        fat_escribir(modificacion->indice, modificacion->valor);
-        break;
-      case MOD_BLOQUE:
-        bloque_escribir(modificacion->indice, modificacion->datos, nombre);
-        break;
-    }
-  }
-  msync(volumen, tam_volumen, MS_SYNC);
-}
-
-t_resultado_fs fs_guardar(char* nombre, void* datos, uint32_t tamanio) {
+t_resultado_checkpoint fs_guardar(char* nombre, void* datos, uint32_t tamanio) {
   pthread_mutex_lock(&mutex_fs);
   empezar_operacion();
   int indice = buscar_entrada(nombre, false);
@@ -340,18 +461,18 @@ t_resultado_fs fs_guardar(char* nombre, void* datos, uint32_t tamanio) {
                           : necesarios;
   uint32_t faltan = necesarios - reusados;
   uint32_t* nuevos = calloc(faltan + 1, sizeof(uint32_t));
-  t_resultado_fs resultado = FS_OK;
+  t_resultado_checkpoint resultado = CHECKPOINT_OK;
   if (indice < 0) {
     log_error(logger, "## ERROR - Directorio lleno al intentar guardar: %s",
               nombre);
-    resultado = FS_DIRECTORIO_LLENO;
+    resultado = CHECKPOINT_DIRECTORIO_LLENO;
   } else if (buscar_libres(faltan, nuevos) < faltan) {
     log_error(logger,
               "## ERROR - Falta de espacio en FAT al intentar guardar: %s",
               nombre);
-    resultado = FS_SIN_ESPACIO;
+    resultado = CHECKPOINT_SIN_ESPACIO;
   }
-  if (resultado != FS_OK) {  // no se tocó nada del volumen
+  if (resultado != CHECKPOINT_OK) {  // no se tocó nada del volumen
     free(nuevos);
     list_destroy_and_destroy_elements(cadena_vieja, free);
     pthread_mutex_unlock(&mutex_fs);
@@ -382,37 +503,65 @@ t_resultado_fs fs_guardar(char* nombre, void* datos, uint32_t tamanio) {
         tamanio - inicio < tam_bloque ? tamanio - inicio : tam_bloque;
     agregar_bloque(plan, cadena[i], (uint8_t*)datos + inicio, cuanto);
   }
-  aplicar(plan, nombre);
+  ejecutar(plan, nombre);  // Check 4: journal + volumen
 
   list_destroy_and_destroy_elements(plan, destruir_modificacion);
   list_destroy_and_destroy_elements(cadena_vieja, free);
   free(cadena);
   free(nuevos);
   pthread_mutex_unlock(&mutex_fs);
-  return FS_OK;
+  return CHECKPOINT_OK;
 }
 
-t_resultado_fs fs_eliminar(char* nombre) {
+// Check 4: el contenido completo, siguiendo la cadena de la FAT. No modifica
+// el volumen, así que no pasa por el journal.
+t_resultado_checkpoint fs_cargar(char* nombre, void** datos,
+                                 uint32_t* tamanio) {
   pthread_mutex_lock(&mutex_fs);
   empezar_operacion();
   int indice = buscar_entrada(nombre, false);
   if (indice < 0) {
     pthread_mutex_unlock(&mutex_fs);
     log_warning(logger, "No existe el Checkpoint %s", nombre);
-    return FS_NO_EXISTE;
+    return CHECKPOINT_NO_EXISTE;
   }
+  t_entrada_directorio entrada = directorio()[indice];
+  // Un bloque de más: bloque_leer copia bloques enteros
+  uint8_t* contenido = calloc(1, entrada.tamanio + tam_bloque);
+  uint32_t bloque = entrada.primer_bloque;
+  for (uint32_t leidos = 0; leidos < entrada.tamanio && bloque < cant_bloques;
+       leidos += tam_bloque) {
+    bloque_leer(bloque, contenido + leidos, nombre);
+    if (leidos + tam_bloque < entrada.tamanio) bloque = fat_leer(bloque);
+  }
+  pthread_mutex_unlock(&mutex_fs);
+  *datos = contenido;
+  *tamanio = entrada.tamanio;
+  return CHECKPOINT_OK;
+}
+
+t_resultado_checkpoint fs_eliminar(char* nombre, uint32_t* tamanio) {
+  pthread_mutex_lock(&mutex_fs);
+  empezar_operacion();
+  int indice = buscar_entrada(nombre, false);
+  if (indice < 0) {
+    pthread_mutex_unlock(&mutex_fs);
+    log_warning(logger, "No existe el Checkpoint %s", nombre);
+    return CHECKPOINT_NO_EXISTE;
+  }
+  if (tamanio != NULL) *tamanio = directorio()[indice].tamanio;
   t_list* cadena = leer_cadena(directorio()[indice].primer_bloque);
   t_list* plan = list_create();
   t_entrada_directorio libre = {0};
   agregar_directorio(plan, indice, libre);
   for (int i = 0; i < list_size(cadena); i++)
     agregar_fat(plan, *(uint32_t*)list_get(cadena, i), FAT_LIBRE);
-  aplicar(plan, nombre);
+  ejecutar(plan, nombre);  // Check 4: journal + volumen
 
   list_destroy_and_destroy_elements(plan, destruir_modificacion);
   list_destroy_and_destroy_elements(cadena, free);
   pthread_mutex_unlock(&mutex_fs);
-  return FS_OK;
+  return CHECKPOINT_OK;
 }
 
 // ---------- Comandos de consola ----------
