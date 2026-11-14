@@ -15,9 +15,11 @@
 #include <utils/paquete.h>
 #include <utils/servidor.h>
 
+#include "checkpoints.h"
 #include "placa_cliente.h"
 #include "planificador.h"
 #include "servicios.h"
+#include "storage_cliente.h"
 
 // Los motivos de DEVOLVER_JOB (FIN_QUANTUM, FIN_EJECUCION, PAGE_FAULT,
 // FIN_ERROR) ahora están en utils/paquete.h
@@ -299,6 +301,20 @@ void desbloquear_job(uint32_t jid) {
   corto_plazo();
 }
 
+void finalizar_job_bloqueado(uint32_t jid, char* motivo) {
+  t_job* finalizado = NULL;
+  pthread_mutex_lock(&mutex_jobs);
+  t_job* job = buscar_job(jid);
+  if (job != NULL && job->estado == BLOCKED) {
+    finalizar_job(job, motivo);
+    finalizado = job;
+  }
+  pthread_mutex_unlock(&mutex_jobs);
+  if (finalizado != NULL) destruir_job(finalizado);  // pedido a la Placa
+  largo_plazo();  // se liberó un lugar del grado de multiprogramación
+  corto_plazo();
+}
+
 typedef struct {
   uint32_t jid;
   uint32_t nro_pagina;
@@ -486,16 +502,10 @@ static void atender_syscall_bloqueante(int fd_conexion, t_core* core) {
   pthread_mutex_unlock(&mutex_jobs);
   list_destroy_and_destroy_elements(campos, free);
 
-  if (pedido->tipo >= SYS_SAVE_CHECKPOINT) {
-    // Check 4: todavía no hay Storage. El Job sigue como si hubiera terminado.
-    log_warning(logger, "## (%u) - %s se implementa en el Check 4", pedido->jid,
-                nombre_syscall(pedido->tipo));
-    deslockear_paginas_en_placa(pedido->jid);
-    desbloquear_job(pedido->jid);
-    destruir_pedido_servicio(pedido);
-  } else {
+  if (pedido->tipo >= SYS_SAVE_CHECKPOINT)
+    atender_checkpoint(pedido);  // Check 4: en un hilo, con el Storage
+  else
     encolar_pedido_servicio(pedido);
-  }
   corto_plazo();
 }
 
@@ -646,10 +656,9 @@ int main(int argc, char* argv[]) {
   enviar_handshake(fd_placa, "PLANIFICADOR");
   placa_iniciar(fd_placa);  // Check 3: el fd lo maneja placa_cliente.c
 
-  int fd_storage =
-      crear_conexion(config_get_string_value(config, "IP_STORAGE"),
-                     config_get_string_value(config, "PUERTO_STORAGE"));
-  enviar_handshake(fd_storage, "PLANIFICADOR");
+  // Check 4: el fd lo maneja storage_cliente.c
+  storage_iniciar(config_get_string_value(config, "IP_STORAGE"),
+                  config_get_string_value(config, "PUERTO_STORAGE"));
 
   servicios_iniciar(config);  // Check 3: hilos de Loader, Labeler y Logger
 
